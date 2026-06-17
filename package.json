@@ -12,7 +12,15 @@
     "type": "git",
     "url": "git+https://github.com/yogeshbura25/ai-engineering-learning.git"
   },
-  "keywords": ["ai", "llm", "gemini", "nodejs", "javascript", "express", "learning"],
+  "keywords": [
+    "ai",
+    "llm",
+    "gemini",
+    "nodejs",
+    "javascript",
+    "express",
+    "learning"
+  ],
   "author": "Yogesh",
   "license": "ISC",
   "type": "module",
@@ -22,8 +30,11 @@
   "homepage": "https://github.com/yogeshbura25/ai-engineering-learning#readme",
   "dependencies": {
     "@google/genai": "^2.8.0",
+    "@pinecone-database/pinecone": "^8.0.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
-    "nodemon": "^3.1.14"
+    "multer": "^2.2.0",
+    "nodemon": "^3.1.14",
+    "pdf-parse": "^2.4.5"
   }
 }
