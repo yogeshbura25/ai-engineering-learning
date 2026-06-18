@@ -123,7 +123,7 @@ export async function uploadDocument(filePath, fileName, category = "general") {
         if (!embedding) return;
 
         vectors.push({
-          id: `${Date.now()}-${chunkIndex}`,
+          id: `${fileName}-${chunkIndex}`,
 
           values: embedding,
 
@@ -155,7 +155,7 @@ export async function uploadDocument(filePath, fileName, category = "general") {
     for (let i = 0; i < vectors.length; i += BATCH_SIZE) {
       const batch = vectors.slice(i, i + BATCH_SIZE);
 
-      await pineconeIndex.upsert({
+      await pineconeIndex.namespace(category || "general").upsert({
         records: batch,
       });
 
@@ -168,11 +168,11 @@ export async function uploadDocument(filePath, fileName, category = "general") {
     // Cleanup
     // ===========================
 
-    try {
-      await fs.unlink(filePath);
-    } catch (err) {
-      console.error("File cleanup failed:", err.message);
-    }
+    // try {
+    //   await fs.unlink(filePath);
+    // } catch (err) {
+    //   console.error("File cleanup failed:", err.message);
+    // }
 
     console.timeEnd("total-upload");
 
@@ -271,7 +271,7 @@ export async function uploadDocument(filePath, fileName, category = "general") {
 //     }
 //     // console.log("embedding", embedding)
 //     vectors.push({
-//       id: `${category}-${fileName}-chunk-${i}`,
+//       id: `${fileName}-${chunkIndex}`,
 
 //       values: embedding,
 
