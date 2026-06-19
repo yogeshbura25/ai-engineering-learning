@@ -5,14 +5,14 @@ import { pineconeIndex } from "../config/pinecone.js";
 
 function chunkText(text, chunkSize = 500, overlap = 50) {
 
-  if (text.includes("Q:") || text.includes("Q :")) {
-    const parts = text.split(/(?=Q\s*:)/i);
+  if (/Q\s*\d*\s*:/i.test(text)) {
+    const parts = text.split(/(?=Q\s*\d*\s*:)/i);
 
     const chunks = [];
 
     let header = "";
 
-    if (parts.length > 0 && !parts[0].trim().toLowerCase().startsWith("q:")) {
+    if (parts.length > 0 && !/^Q\s*\d*\s*:/i.test(parts[0].trim())) {
       header = parts.shift().trim();
     }
 

@@ -39,35 +39,91 @@ Standalone Question:`;
     }
   }
 
-  // Step 2: Generate query embedding
-  const embeddingResponse = await geminiai.models.embedContent({
-    model: "gemini-embedding-001",
-    contents: searchQuery,
-    config: {
-      outputDimensionality: 1024,
-    },
-  });
+  // Step 2: Query Decomposition (Sub-Query RAG)
+  let subQueries = [searchQuery];
+  try {
+    const decompositionPrompt = `
+You are an expert search assistant.
+Decompose the following user question into 1 to 3 simpler, independent, standalone sub-questions that can be used for vector search.
+If the question is already simple and cannot be decomposed, return it as the only element in the array.
 
-  const queryEmbedding =
-    embeddingResponse.embedding?.values ||
-    embeddingResponse.embeddings?.[0]?.values;
+Respond ONLY with a valid JSON array of strings. Do not include markdown code block formatting (like \`\`\`json) or any other text.
 
-  if (!queryEmbedding) {
-    throw new Error("Failed to generate query embedding");
+Question: "${searchQuery}"
+`;
+
+    const decompositionResponse = await geminiai.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: decompositionPrompt,
+    });
+
+    const cleanText = decompositionResponse.text.trim().replace(/^```json\s*|```\s*$/gi, '');
+    const parsed = JSON.parse(cleanText);
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      subQueries = parsed;
+      console.log(`[RAG Sub-Queries] Decomposed into:`, subQueries);
+    }
+  } catch (err) {
+    console.error("Failed to decompose query, using fallback:", err.message);
   }
 
-  // Step 3: Search Pinecone
-  const searchResults = await pineconeIndex
-    .namespace(category || "general")
-    .query({
-      vector: queryEmbedding,
-      topK: 5,
-      includeMetadata: true,
-    });
-//   console.log("Pinecone search results matches:", JSON.stringify(searchResults.matches, null, 2));
+  // Step 3: Embed and Query Pinecone for each sub-query in parallel
+  const allMatches = [];
+  try {
+    const queryPromises = subQueries.map(async (subQ) => {
+      // 1. Generate embedding
+      const embeddingResponse = await geminiai.models.embedContent({
+        model: "gemini-embedding-001",
+        contents: subQ,
+        config: {
+          outputDimensionality: 1024,
+        },
+      });
 
-  // Step 4: Build Context
-  const context = searchResults.matches
+      const embedding =
+        embeddingResponse.embedding?.values ||
+        embeddingResponse.embeddings?.[0]?.values;
+
+      if (!embedding) {
+        throw new Error(`Failed to generate embedding for: ${subQ}`);
+      }
+
+      // 2. Query Pinecone
+      const results = await pineconeIndex
+        .namespace(category || "general")
+        .query({
+          vector: embedding,
+          topK: 5,
+          includeMetadata: true,
+        });
+
+      return results.matches || [];
+    });
+
+    const resultsArray = await Promise.all(queryPromises);
+
+    // Merge and deduplicate matches
+    const seenIds = new Set();
+    for (const matches of resultsArray) {
+      for (const match of matches) {
+        if (!seenIds.has(match.id)) {
+          seenIds.add(match.id);
+          allMatches.push(match);
+        }
+      }
+    }
+
+    // Sort by relevance score descending
+    allMatches.sort((a, b) => b.score - a.score);
+  } catch (error) {
+    console.error("Error during sub-query parallel search:", error);
+    throw error;
+  }
+
+  // Step 4: Build Context (Sorted chronologically by chunkIndex for cohesion)
+  const context = allMatches
+    .slice(0, 7) // Take top 7 most relevant unique matches
+    .sort((a, b) => a.metadata.chunkIndex - b.metadata.chunkIndex)
     .map((match) => match.metadata.text)
     .join("\n\n");
 
@@ -77,24 +133,43 @@ Standalone Question:`;
     : "No previous chat history.";
 
   const prompt = `
-You are a helpful assistant.
+<System Role>
+You are an expert customer support AI assistant specializing in answering user queries based on provided documentation.
+</System Role>
 
-Use the provided context to answer the question.
+<Instructions>
+1. Analyze the retrieved [Context] and the [Chat History] carefully.
+2. Answer the [User Question] accurately, and explain it naturally.
+3. Prioritize information matching the category of the question if applicable.
+Use all relevant information from the provided context.
+4. If multiple context sections answer different parts of the question,
+5. combine them into a single complete response.
+</Instructions>
 
-If the context contains relevant information,
-rephrase and explain it naturally.
+<Guardrails>
+1. Answer ONLY using the facts present in the provided [Context].
+2. Do NOT extrapolate, speculate, or mention any information that is not explicitly stated in the [Context].
+3. If the answer cannot be found or inferred from the provided [Context], respond exactly with: "I could not find the answer in the uploaded documents."
+4. Avoid references to "according to the context" or "the provided documents". Answer directly and naturally.
+</Guardrails>
 
-Only say "I could not find the answer in the uploaded documents"
-if no relevant information exists.
+<Output Formatting>
+- Keep your response clear, concise, and structured.
+- Use bullet points or numbered lists where appropriate for readability.
+- Maintain a polite, professional, and helpful tone.
+</Output Formatting>
 
-Context:
+<Context>
 ${context}
+</Context>
 
-Chat History:
+<Chat History>
 ${historyText}
+</Chat History>
 
-User's Question:
+<User Question>
 ${question}
+</User Question>
 `;
 
   // Step 6: Generate Final Answer
