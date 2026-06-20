@@ -1,58 +1,147 @@
 # AI Engineering Learning Server
 
-A simple Node.js Express server demonstrating RAG (Retrieval-Augmented Generation) using Google Gemini models, Pinecone Vector Database, and persistent conversational memory using PostgreSQL with Prisma ORM.
+A Node.js Express server demonstrating a production-style **RAG (Retrieval-Augmented Generation)** pipeline using Google Gemini models, Pinecone Vector Database, and persistent conversational memory with PostgreSQL (Prisma ORM).
+
+---
 
 ## Features
 
-* **PDF Text Extraction**: Parses uploaded PDF documents (including customized parsing for FAQ lists to keep question-answer blocks together).
-* **Vector Embeddings**: Generates 1024-dimensional embeddings for text chunks using the `gemini-embedding-001` model.
-* **Vector Storage**: Batches and upserts embeddings into Pinecone with source, category, and chunk metadata.
-* **Namespaces**: Isolates vectors in Pinecone under separate namespaces based on document category.
-* **Conversational Memory**: Stores message history in a PostgreSQL database under unique session IDs.
-* **Query Rephrasing**: Translates follow-up questions (e.g. *"Can you explain the first step?"*) into standalone search queries using past chat history.
-* **Context-Aware QA (RAG)**: Queries Pinecone for relevant context and uses `gemini-2.5-flash` to answer questions based on the retrieved document context and conversational history.
+* **PDF Text Extraction** — Parses uploaded PDF documents with customized FAQ-aware chunking (keeps Q&A blocks together).
+* **Vector Embeddings** — Generates 1024-dimensional embeddings using the `gemini-embedding-001` model.
+* **Vector Storage** — Batches and upserts embeddings into Pinecone with source, category, and chunk metadata.
+* **Namespaces** — Isolates vectors in Pinecone under separate namespaces based on document category.
+* **Conversational Memory** — Stores message history in PostgreSQL under unique session IDs.
+* **Query Rephrasing** — Translates follow-up questions (e.g. *"Can you explain the first step?"*) into standalone search queries using past chat history.
+* **Sub-Query Decomposition** — Breaks complex questions into 1–3 simpler sub-queries and runs them in parallel for broader retrieval coverage.
+* **Re-Ranking** — Combines Pinecone's vector similarity score (70%) with keyword overlap score (30%) to re-order results before building context.
+* **Context-Aware QA (RAG)** — Queries Pinecone for relevant context and uses `gemini-2.5-flash` to answer questions based on retrieved documents and conversational history.
+
+---
+
+## RAG Pipeline Architecture
+
+```text
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           /api/ask-rag                                      │
+│                                                                             │
+│  ┌──────────────┐   ┌──────────────────┐   ┌─────────────────────────────┐  │
+│  │ Step 1       │   │ Step 2           │   │ Step 3                      │  │
+│  │ Chat History │──▶│ Query            │──▶│ Embed + Query Pinecone      │  │
+│  │ + Rephrase   │   │ Decomposition    │   │ (parallel sub-queries)      │  │
+│  └──────────────┘   │ (1–3 sub-queries)│   │ + Merge & Deduplicate       │  │
+│                     └──────────────────┘   └────────────┬────────────────┘  │
+│                                                         │                   │
+│                                                         ▼                   │
+│  ┌──────────────┐   ┌──────────────────┐   ┌─────────────────────────────┐  │
+│  │ Step 6       │   │ Step 5           │   │ Step 3b                     │  │
+│  │ Generate     │◀──│ Build LLM        │◀──│ RE-RANKING                  │  │
+│  │ Final Answer │   │ Prompt           │   │ (vector score × 0.7 +       │  │
+│  │ (Gemini)     │   │                  │   │  keyword score × 0.3)       │  │
+│  └──────┬───────┘   └──────────────────┘   └─────────────────────────────┘  │
+│         │                                                                   │
+│         ▼                                                                   │
+│  ┌──────────────┐                                                           │
+│  │ Step 7       │                                                           │
+│  │ Save to      │                                                           │
+│  │ PostgreSQL   │                                                           │
+│  └──────────────┘                                                           │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## Repository Structure
 
 ```text
-├── server.js                 # Entrypoint: Initializes Express app and routes
-├── .env                      # Configuration (API keys, index names, db url)
+├── server.js                     # Entrypoint: Initializes Express app and routes
+├── .env                          # Configuration (API keys, index names, db url)
 ├── prisma/
-│   └── schema.prisma         # Prisma database schema definition
+│   └── schema.prisma             # Prisma database schema definition
 └── src/
     ├── config/
-    │   ├── geminiai.js       # Google Gen AI SDK initialization
-    │   ├── pinecone.js       # Pinecone database client configuration
-    │   └── prisma.js         # Prisma client instance configuration
+    │   ├── geminiai.js           # Google Gen AI SDK initialization
+    │   ├── pinecone.js           # Pinecone database client configuration
+    │   └── prisma.js             # Prisma client instance configuration
     ├── controller/
-    │   ├── documentupload.js # Handles file upload requests
-    │   ├── prompt.js         # Handles QA/prompt requests
-    │   └── ragController.js  # Handles RAG QA with session history requests
+    │   ├── documentupload.js     # Handles file upload requests
+    │   ├── prompt.js             # Handles direct QA/prompt requests
+    │   └── ragController.js      # Handles RAG QA with session history requests
     ├── routes/
-    │   └── index.js          # API route definitions (/ask, /upload, /ask-rag)
+    │   └── index.js              # API route definitions (/ask, /upload, /ask-rag)
     └── services/
-        ├── chatHistoryService.js # Message log persistency queries using Prisma
-        ├── documentService.js# Extracts, chunks, embeds, and uploads PDFs to Pinecone
-        ├── llmService.js     # Direct LLM generation helper
-        └── ragService.js     # Pinecone query + LLM RAG + Memory rephrase answering pipeline
+        ├── chatHistoryService.js # Message log persistence using Prisma
+        ├── documentService.js    # Extracts, chunks, embeds, and uploads PDFs to Pinecone
+        ├── llmService.js         # Direct LLM generation helper
+        ├── ragService.js         # RAG pipeline orchestrator (rephrase → decompose → search → re-rank → answer)
+        └── rerankingService.js   # Re-ranking: keyword overlap scoring + context builder
 ```
+
+---
+
+## Re-Ranking
+
+The re-ranking service (`rerankingService.js`) improves retrieval quality by combining two signals:
+
+| Signal | Weight | Description |
+|--------|--------|-------------|
+| **Vector Similarity** | 70% | Pinecone's cosine similarity score (semantic meaning) |
+| **Keyword Overlap** | 30% | Fraction of query keywords found in the chunk text |
+
+**Formula**: `rerankScore = (pineconeScore × 0.7) + (keywordScore × 0.3)`
+
+This is a **read-only, in-memory** operation — nothing is written back to Pinecone or the database. It simply re-orders the results that Pinecone already returned before building the LLM context.
+
+Exported functions:
+- `rerankMatches(matches, searchQuery)` — Scores and re-sorts matches
+- `buildContext(rerankedMatches, topK)` — Takes top K results, sorts by chunk order, joins text
+- `logRerankResults(before, after)` — Console logging for debugging
 
 ---
 
 ## Database Configuration
 
-Prisma manages connection setup using the `DATABASE_URL` variable in your `.env` file:
+Prisma manages the PostgreSQL connection using the `DATABASE_URL` variable in your `.env` file:
 
 ```env
 DATABASE_URL="postgresql://username:password@localhost:5432/rag_memory"
 ```
 
-To sync the schema definitions with your local PostgreSQL database, run:
+To sync the schema with your local PostgreSQL database:
 
 ```bash
 npx prisma db push
+```
+
+---
+
+## Environment Variables
+
+Create a `.env` file in the project root with:
+
+```env
+GEMINI_API_KEY=your_gemini_api_key
+PINECONE_API_KEY=your_pinecone_api_key
+PINECONE_INDEX_NAME=your_index_name
+DATABASE_URL=postgresql://username:password@localhost:5432/rag_memory
+PORT=3000
+```
+
+---
+
+## Getting Started
+
+```bash
+# Install dependencies
+npm install
+
+# Generate Prisma client
+npx prisma generate
+
+# Push database schema
+npx prisma db push
+
+# Start development server
+npm run dev
 ```
 
 ---
@@ -83,7 +172,7 @@ Sends the prompt directly to the Gemini LLM model (`gemini-2.5-flash`) without c
 ---
 
 ### 3. Ask a Question with RAG and Memory
-Queries the Pinecone category namespace for relevant context (using rephrased queries from chat history) and uses the retrieved context and message history to answer the question using `gemini-2.5-flash`.
+Queries the Pinecone category namespace for relevant context (with sub-query decomposition, re-ranking, and chat history rephrasing) and uses the retrieved context to answer the question using `gemini-2.5-flash`.
 
 * **URL**: `/api/ask-rag`
 * **Method**: `POST`
@@ -92,3 +181,15 @@ Queries the Pinecone category namespace for relevant context (using rephrased qu
   * `question`: The question you want to ask.
   * `category` *(optional)*: The category namespace to search within (e.g. `"faq"`, `"billing"`). Defaults to `"general"`.
   * `sessionId` *(optional)*: The conversation session ID. If not provided, the server auto-generates a new session UUID and returns it in the response so you can reuse it for follow-up questions.
+
+---
+
+## Tech Stack
+
+| Technology | Purpose |
+|------------|---------|
+| **Node.js + Express** | Server framework |
+| **Google Gemini** | LLM (gemini-2.5-flash) + Embeddings (gemini-embedding-001) |
+| **Pinecone** | Vector database for semantic search |
+| **PostgreSQL + Prisma** | Chat history persistence |
+| **pdf-parse** | PDF text extraction |

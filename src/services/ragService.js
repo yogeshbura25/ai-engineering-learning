@@ -1,6 +1,7 @@
 import geminiai from "../config/geminiai.js";
 import { pineconeIndex } from "../config/pinecone.js";
 import { getChatHistory, saveMessage } from "./chatHistoryService.js";
+import { rerankMatches, buildContext, logRerankResults } from "./rerankingService.js";
 
 export const askRAG = async (question, category, sessionId) => {
   let searchQuery = question;
@@ -69,6 +70,7 @@ Question: "${searchQuery}"
 
   // Step 3: Embed and Query Pinecone for each sub-query in parallel
   const allMatches = [];
+  let context = '';
   try {
     const queryPromises = subQueries.map(async (subQ) => {
       // 1. Generate embedding
@@ -113,19 +115,16 @@ Question: "${searchQuery}"
       }
     }
 
-    // Sort by relevance score descending
-    allMatches.sort((a, b) => b.score - a.score);
+    // Step 3b: Re-rank matches using keyword overlap
+    const rerankedMatches = rerankMatches(allMatches, searchQuery);
+    logRerankResults(allMatches, rerankedMatches);
+
+    // Step 4: Build Context (Sorted chronologically by chunkIndex for cohesion)
+    context = buildContext(rerankedMatches, 7);
   } catch (error) {
     console.error("Error during sub-query parallel search:", error);
     throw error;
   }
-
-  // Step 4: Build Context (Sorted chronologically by chunkIndex for cohesion)
-  const context = allMatches
-    .slice(0, 7) // Take top 7 most relevant unique matches
-    .sort((a, b) => a.metadata.chunkIndex - b.metadata.chunkIndex)
-    .map((match) => match.metadata.text)
-    .join("\n\n");
 
   // Step 5: Prompt LLM with Context and Chat History
   const historyText = history && history.length > 0
@@ -193,4 +192,5 @@ ${question}
   return {
     answer,
   };
+
 }
