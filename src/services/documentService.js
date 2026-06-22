@@ -2,6 +2,7 @@ import fs from "fs/promises";
 import { PDFParse } from "pdf-parse";
 import geminiai from "../config/geminiai.js";
 import { pineconeIndex } from "../config/pinecone.js";
+import prisma from "../config/prisma.js";
 
 function chunkText(text, chunkSize = 500, overlap = 50) {
 
@@ -143,6 +144,37 @@ export async function uploadDocument(filePath, fileName, category = "general") {
     console.timeEnd("embedding");
 
     console.log(`Generated ${vectors.length} embeddings`);
+
+    // ===========================
+    // PostgreSQL Storage
+    // ===========================
+    console.time("postgres-upsert");
+    try {
+      // Clear existing chunks for this source and category to avoid duplicates/stale data
+      await prisma.documentChunk.deleteMany({
+        where: {
+          source: fileName,
+          category: category || "general",
+        },
+      });
+
+      // Bulk insert the new chunks
+      await prisma.documentChunk.createMany({
+        data: vectors.map((v) => ({
+          id: v.id,
+          text: v.metadata.text,
+          source: v.metadata.source,
+          category: v.metadata.category,
+          chunkIndex: v.metadata.chunkIndex,
+        })),
+        skipDuplicates: true,
+      });
+      console.log(`Saved ${vectors.length} chunks to PostgreSQL.`);
+    } catch (dbError) {
+      console.error("Error saving chunks to PostgreSQL:", dbError);
+      throw dbError;
+    }
+    console.timeEnd("postgres-upsert");
 
     // ===========================
     // Pinecone Upload

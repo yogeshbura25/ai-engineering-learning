@@ -1,5 +1,6 @@
 import geminiai from "../config/geminiai.js";
 import { pineconeIndex } from "../config/pinecone.js";
+import prisma from "../config/prisma.js";
 import { getChatHistory, saveMessage } from "./chatHistoryService.js";
 import { rerankMatches, buildContext, logRerankResults } from "./rerankingService.js";
 
@@ -68,49 +69,104 @@ Question: "${searchQuery}"
     console.error("Failed to decompose query, using fallback:", err.message);
   }
 
-  // Step 3: Embed and Query Pinecone for each sub-query in parallel
+  // Step 3: Embed and Query Pinecone (semantic) + Query Postgres (keyword) for each sub-query in parallel
   const allMatches = [];
   let context = '';
   try {
     const queryPromises = subQueries.map(async (subQ) => {
-      // 1. Generate embedding
-      const embeddingResponse = await geminiai.models.embedContent({
-        model: "gemini-embedding-001",
-        contents: subQ,
-        config: {
-          outputDimensionality: 1024,
-        },
-      });
-
-      const embedding =
-        embeddingResponse.embedding?.values ||
-        embeddingResponse.embeddings?.[0]?.values;
-
-      if (!embedding) {
-        throw new Error(`Failed to generate embedding for: ${subQ}`);
-      }
-
-      // 2. Query Pinecone
-      const results = await pineconeIndex
-        .namespace(category || "general")
-        .query({
-          vector: embedding,
-          topK: 5,
-          includeMetadata: true,
+      // 1. Semantic Search: Embed and Query Pinecone
+      const vectorSearchPromise = (async () => {
+        const embeddingResponse = await geminiai.models.embedContent({
+          model: "gemini-embedding-001",
+          contents: subQ,
+          config: {
+            outputDimensionality: 1024,
+          },
         });
 
-      return results.matches || [];
+        const embedding =
+          embeddingResponse.embedding?.values ||
+          embeddingResponse.embeddings?.[0]?.values;
+
+        if (!embedding) {
+          throw new Error(`Failed to generate embedding for: ${subQ}`);
+        }
+
+        const results = await pineconeIndex
+          .namespace(category || "general")
+          .query({
+            vector: embedding,
+            topK: 5,
+            includeMetadata: true,
+          });
+
+        return results.matches || [];
+      })();
+
+      // 2. Keyword Search: Query PostgreSQL
+      const keywordSearchPromise = (async () => {
+        const MIN_WORD_LENGTH = 3;
+        const queryWords = subQ
+          .toLowerCase()
+          .split(/\s+/)
+          .filter(word => word.length >= MIN_WORD_LENGTH);
+
+        if (queryWords.length === 0) {
+          return [];
+        }
+
+        return await prisma.documentChunk.findMany({
+          where: {
+            category: category || "general",
+            OR: queryWords.map(word => ({
+              text: {
+                contains: word,
+                mode: 'insensitive',
+              },
+            })),
+          },
+          take: 5,
+        });
+      })();
+
+      const [vectorMatches, keywordMatches] = await Promise.all([
+        vectorSearchPromise,
+        keywordSearchPromise,
+      ]);
+
+      return { vectorMatches, keywordMatches };
     });
 
     const resultsArray = await Promise.all(queryPromises);
 
     // Merge and deduplicate matches
     const seenIds = new Set();
-    for (const matches of resultsArray) {
-      for (const match of matches) {
+    
+    // First add all vector matches (maintaining their high-fidelity vector similarity scores)
+    for (const res of resultsArray) {
+      for (const match of res.vectorMatches) {
         if (!seenIds.has(match.id)) {
           seenIds.add(match.id);
           allMatches.push(match);
+        }
+      }
+    }
+
+    // Then add keyword matches that were NOT retrieved by vector search, with score = 0.0
+    for (const res of resultsArray) {
+      for (const chunk of res.keywordMatches) {
+        if (!seenIds.has(chunk.id)) {
+          seenIds.add(chunk.id);
+          allMatches.push({
+            id: chunk.id,
+            score: 0.0, // base vector similarity score
+            metadata: {
+              source: chunk.source,
+              category: chunk.category,
+              chunkIndex: chunk.chunkIndex,
+              text: chunk.text,
+            },
+          });
         }
       }
     }
