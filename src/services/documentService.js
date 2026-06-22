@@ -5,6 +5,12 @@ import { pineconeIndex } from "../config/pinecone.js";
 import prisma from "../config/prisma.js";
 
 function chunkText(text, chunkSize = 500, overlap = 50) {
+  // Ensure chunkSize is a positive integer
+  chunkSize = Math.max(1, Math.floor(chunkSize));
+  // Ensure overlap is non-negative and strictly less than chunkSize to prevent infinite loops
+  if (overlap >= chunkSize || overlap < 0) {
+    overlap = Math.floor(chunkSize * 0.1);
+  }
 
   if (/Q\s*\d*\s*:/i.test(text)) {
     const parts = text.split(/(?=Q\s*\d*\s*:)/i);
@@ -35,7 +41,9 @@ function chunkText(text, chunkSize = 500, overlap = 50) {
 
   const chunks = [];
 
-  for (let i = 0; i < words.length; i += chunkSize - overlap) {
+  const step = chunkSize - overlap;
+
+  for (let i = 0; i < words.length; i += step) {
     chunks.push(words.slice(i, i + chunkSize).join(" "));
   }
 
@@ -220,6 +228,96 @@ export async function uploadDocument(filePath, fileName, category = "general") {
     throw error;
   }
 }
+
+export async function deleteDocument(fileName, category) {
+  try {
+    console.log(`Starting deletion for document: ${fileName}`);
+
+    // 1. Identify which namespaces (categories) this document's chunks exist in, in PostgreSQL
+    let categories = [];
+    if (category) {
+      categories = [category];
+    } else {
+      const distinctChunks = await prisma.documentChunk.findMany({
+        where: { source: fileName },
+        select: { category: true },
+        distinct: ["category"],
+      });
+      categories = distinctChunks.map((c) => c.category || "general");
+    }
+
+    if (categories.length === 0) {
+      categories = ["general"];
+    }
+
+    // 2. Delete vectors from Pinecone for each namespace
+    for (const ns of categories) {
+      try {
+        await pineconeIndex.namespace(ns).deleteMany({
+          filter: { source: { $eq: fileName } },
+        });
+        console.log(`Deleted vectors from Pinecone namespace: ${ns}`);
+      } catch (pineconeErr) {
+        console.error(`Error deleting vectors from Pinecone namespace ${ns}:`, pineconeErr.message);
+      }
+    }
+
+    // 3. Clean up empty Pinecone namespaces (0 records left)
+    try {
+      const stats = await pineconeIndex.describeIndexStats();
+      for (const ns of categories) {
+        const nsStats = stats.namespaces?.[ns];
+        if (nsStats && nsStats.recordCount === 0) {
+          console.log(`Namespace "${ns}" has 0 records. Deleting empty namespace from Pinecone.`);
+          try {
+            await pineconeIndex.deleteNamespace(ns);
+            console.log(`Successfully deleted empty Pinecone namespace: ${ns}`);
+          } catch (deleteNsErr) {
+            console.warn(`deleteNamespace failed for "${ns}", trying deleteAll fallback:`, deleteNsErr.message);
+            try {
+              await pineconeIndex.namespace(ns).deleteAll();
+              console.log(`Successfully ran deleteAll on empty namespace: ${ns}`);
+            } catch (deleteAllErr) {
+              console.error(`Could not clean up empty namespace "${ns}":`, deleteAllErr.message);
+            }
+          }
+        }
+      }
+    } catch (statsErr) {
+      console.error("Error reading index statistics for namespace cleanup:", statsErr.message);
+    }
+
+    // 4. Delete chunks from PostgreSQL database
+    const dbDeleteResult = await prisma.documentChunk.deleteMany({
+      where: { source: fileName },
+    });
+    console.log(`Deleted ${dbDeleteResult.count} chunks from PostgreSQL database.`);
+
+    // 4. Delete the file from the uploads directory
+    const localFilePath = `./uploads/${fileName}`;
+    try {
+      await fs.unlink(localFilePath);
+      console.log(`Deleted local file: ${localFilePath}`);
+    } catch (fsErr) {
+      if (fsErr.code === 'ENOENT') {
+        console.log(`Local file ${localFilePath} not found, skipping file cleanup.`);
+      } else {
+        console.error(`Error deleting local file ${localFilePath}:`, fsErr.message);
+      }
+    }
+
+    return {
+      success: true,
+      message: `Document ${fileName} deleted successfully.`,
+      databaseChunksDeleted: dbDeleteResult.count,
+      namespacesCleaned: categories,
+    };
+  } catch (error) {
+    console.error(`Error during deleteDocument for ${fileName}:`, error);
+    throw error;
+  }
+}
+
 
 // import fs from "fs";
 // import { PDFParse } from "pdf-parse";

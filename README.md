@@ -6,15 +6,16 @@ A Node.js Express server demonstrating a production-style **RAG (Retrieval-Augme
 
 ## Features
 
-* **PDF Text Extraction** — Parses uploaded PDF documents with customized FAQ-aware chunking (keeps Q&A blocks together).
+* **PDF Text Extraction** — Parses uploaded PDF documents with customized FAQ-aware chunking (keeps Q&A blocks together) and safety guards against infinite loops.
 * **Vector Embeddings** — Generates 1024-dimensional embeddings using the `gemini-embedding-001` model.
-* **Vector Storage** — Batches and upserts embeddings into Pinecone with source, category, and chunk metadata.
-* **Namespaces** — Isolates vectors in Pinecone under separate namespaces based on document category.
+* **Vector & Relational Storage** — Batches and upserts embeddings into Pinecone with source, category, and chunk metadata, while simultaneously storing chunks in PostgreSQL.
+* **Namespaces** — Isolates vectors in Pinecone under separate namespaces based on document category (defaulting consistently to `"general"`).
 * **Conversational Memory** — Stores message history in PostgreSQL under unique session IDs.
 * **Query Rephrasing** — Translates follow-up questions (e.g. *"Can you explain the first step?"*) into standalone search queries using past chat history.
 * **Sub-Query Decomposition** — Breaks complex questions into 1–3 simpler sub-queries and runs them in parallel for broader retrieval coverage.
-* **Re-Ranking** — Combines Pinecone's vector similarity score (70%) with keyword overlap score (30%) to re-order results before building context.
-* **Context-Aware QA (RAG)** — Queries Pinecone for relevant context and uses `gemini-2.5-flash` to answer questions based on retrieved documents and conversational history.
+* **Hybrid Search (Dense + Sparse)** — Runs parallel queries using semantic vector search (Pinecone) and keyword-based search (PostgreSQL) to retrieve relevant context.
+* **Re-Ranking** — Combines Pinecone's vector similarity score (70% weight, falling back to 0.0 for keyword-only matches) with keyword overlap score (30% weight) to re-order results before building context.
+* **Context-Aware QA (RAG)** — Queries Pinecone and PostgreSQL for relevant context and uses `gemini-2.5-flash` to answer questions based on retrieved documents and conversational history.
 
 ---
 
@@ -184,6 +185,18 @@ Queries the Pinecone category namespace for relevant context (with sub-query dec
 
 ---
 
+### 4. Delete a Document
+Deletes document chunks from Pinecone (dynamically querying the database for all namespaces where the document was loaded, or using the optional category parameter), removes database records, and deletes the local file from the `uploads/` directory.
+
+* **URL**: `/api/documents/:fileName`
+* **Method**: `DELETE`
+* **URL Parameters**:
+  * `fileName`: The name of the file to delete (e.g. `"Company_Policy_QA_25.pdf"`)
+* **Query Parameters**:
+  * `category` *(optional)*: The category namespace (e.g. `"general"`, `"faq"`). If omitted, the API automatically determines the namespaces from the database.
+
+---
+
 ## Tech Stack
 
 | Technology | Purpose |
@@ -191,5 +204,5 @@ Queries the Pinecone category namespace for relevant context (with sub-query dec
 | **Node.js + Express** | Server framework |
 | **Google Gemini** | LLM (gemini-2.5-flash) + Embeddings (gemini-embedding-001) |
 | **Pinecone** | Vector database for semantic search |
-| **PostgreSQL + Prisma** | Chat history persistence |
+| **PostgreSQL + Prisma** | Chat history persistence & document chunk storage for keyword lookup |
 | **pdf-parse** | PDF text extraction |

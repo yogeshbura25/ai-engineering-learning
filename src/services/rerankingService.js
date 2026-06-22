@@ -47,9 +47,12 @@ export const rerankMatches = (matches, searchQuery) => {
       ? keywordMatchCount / queryWords.length
       : 0;
 
+    // Ensure match.score is a valid number, fallback to 0.0
+    const pineconeScore = typeof match.score === 'number' ? match.score : 0.0;
+
     // Weighted combination of vector similarity + keyword overlap
     const rerankScore =
-      (match.score * VECTOR_WEIGHT) +
+      (pineconeScore * VECTOR_WEIGHT) +
       (keywordScore * KEYWORD_WEIGHT);
 
     return {
