@@ -85,8 +85,12 @@ export const buildContext = (rerankedMatches, topK = 7) => {
   return rerankedMatches
     .slice(0, topK)
     .sort((a, b) => (a.metadata?.chunkIndex ?? 0) - (b.metadata?.chunkIndex ?? 0))
-    .map(match => match.metadata?.text ?? '')
-    .join("\n\n");
+    .map(match => {
+      const source = match.metadata?.source ?? 'Unknown Source';
+      const chunkIndex = match.metadata?.chunkIndex ?? 0;
+      return `[Document: ${source}, Chunk: ${chunkIndex}]\n${match.metadata?.text ?? ''}`;
+    })
+    .join("\n\n---\n\n");
 };
 
 /**

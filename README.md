@@ -12,10 +12,16 @@ A Node.js Express server demonstrating a production-style **RAG (Retrieval-Augme
 * **Namespaces** — Isolates vectors in Pinecone under separate namespaces based on document category (defaulting consistently to `"general"`).
 * **Conversational Memory** — Stores message history in PostgreSQL under unique session IDs.
 * **Query Rephrasing** — Translates follow-up questions (e.g. *"Can you explain the first step?"*) into standalone search queries using past chat history.
-* **Sub-Query Decomposition** — Breaks complex questions into 1–3 simpler sub-queries and runs them in parallel for broader retrieval coverage.
+* **Multi-Query Retrieval** — Generates 3 alternative formulations of the user's question to query the database from multiple semantic perspectives in parallel, maximizing retrieval coverage.
 * **Hybrid Search (Dense + Sparse)** — Runs parallel queries using semantic vector search (Pinecone) and keyword-based search (PostgreSQL) to retrieve relevant context.
 * **Re-Ranking** — Combines Pinecone's vector similarity score (70% weight, falling back to 0.0 for keyword-only matches) with keyword overlap score (30% weight) to re-order results before building context.
-* **Context-Aware QA (RAG)** — Queries Pinecone and PostgreSQL for relevant context and uses `gemini-2.5-flash` to answer questions based on retrieved documents and conversational history.
+* **Context Compression** — Employs Gemini 2.5 Flash as a document compressor to filter out irrelevant text/filler and keep only sentences and facts directly addressing the user's query, improving LLM response accuracy.
+* **Context-Aware QA (RAG)** — Queries Pinecone and PostgreSQL for relevant context, compresses it, and uses `gemini-2.5-flash` to answer questions based on the refined facts and conversational history.
+* **Source Citations** — Enforces visual inline source attributions (e.g. `[Document: Policy.pdf, Chunk: 3]`) inside the LLM answer, and returns a structured list of unique retrieved source files in the API JSON response payload.
+* **RAGAS Evaluation (LLM-as-a-Judge)** — Grades RAG query responses in real-time along three key metrics: Faithfulness (groundedness), Answer Relevance, and Context Precision.
+* **Security & Quality Guardrails** — Employs dual-stage guardrails:
+  * **Input Check**: Screens user queries for prompt injections, safety violations, and out-of-scope requests before execution.
+  * **Output Check**: Blocks hallucinated responses (if the evaluated Faithfulness score is below 70%) and returns a safe fallback message.
 
 ---
 
@@ -25,24 +31,40 @@ A Node.js Express server demonstrating a production-style **RAG (Retrieval-Augme
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                           /api/ask-rag                                      │
 │                                                                             │
+│  ┌────────────────┐   ┌──────────────┐   ┌──────────────────┐               │
+│  │ Step 0         │   │ Step 1       │   │ Step 2           │               │
+│  │ Input          │──▶│ Chat History │──▶│ Multi-Query      │──┐            │
+│  │ Guardrails     │   │ + Rephrase   │   │ Generation       │  │            │
+│  └────────────────┘   └──────────────┘   └──────────────────┘  │            │
+│                                                                ▼            │
 │  ┌──────────────┐   ┌──────────────────┐   ┌─────────────────────────────┐  │
-│  │ Step 1       │   │ Step 2           │   │ Step 3                      │  │
-│  │ Chat History │──▶│ Query            │──▶│ Embed + Query Pinecone      │  │
-│  │ + Rephrase   │   │ Decomposition    │   │ (parallel sub-queries)      │  │
-│  └──────────────┘   │ (1–3 sub-queries)│   │ + Merge & Deduplicate       │  │
-│                     └──────────────────┘   └────────────┬────────────────┘  │
-│                                                         │                   │
-│                                                         ▼                   │
-│  ┌──────────────┐   ┌──────────────────┐   ┌─────────────────────────────┐  │
-│  │ Step 6       │   │ Step 5           │   │ Step 3b                     │  │
-│  │ Generate     │◀──│ Build LLM        │◀──│ RE-RANKING                  │  │
-│  │ Final Answer │   │ Prompt           │   │ (vector score × 0.7 +       │  │
-│  │ (Gemini)     │   │                  │   │  keyword score × 0.3)       │  │
-│  └──────┬───────┘   └──────────────────┘   └─────────────────────────────┘  │
+│  │ Step 6       │   │ Step 5           │   │ Step 3                      │  │
+│  │ Generate     │◀──│ Build LLM        │◀──│ Embed + Query Pinecone      │  │
+│  │ Final Answer │   │ Prompt           │   │ (parallel expansion queries)│  │
+│  │ (Gemini)     │   │                  │   │ + Merge & Deduplicate       │  │
+│  └──────┬───────┘   └─────────────▲────┘   └─────────────┬───────────────┘  │
+│         │                         │                      │                  │
+│         │                         │                      ▼                  │
+│         │                         │        ┌─────────────┴───────────────┐  │
+│         │                         │        │ Step 3b                     │  │
+│         │                         │        │ RE-RANKING                  │  │
+│         │                         │        └─────────────┬───────────────┘  │
+│         │                         │                      ▼                  │
+│         │                         │        ┌─────────────────────────────┐  │
+│         │                         │        │ Step 4                      │  │
+│         │                         └────────│ Context Compression         │  │
+│         │                                  │ (Gemini extraction)         │  │
+│         │                                  └─────────────────────────────┘  │
+│         ▼                                                                   │
+│  ┌────────────────┐                                                         │
+│  │ Step 7         │                                                         │
+│  │ Output         │                                                         │
+│  │ Guardrail      │                                                         │
+│  └──────┬─────────┘                                                         │
 │         │                                                                   │
 │         ▼                                                                   │
 │  ┌──────────────┐                                                           │
-│  │ Step 7       │                                                           │
+│  │ Step 8       │                                                           │
 │  │ Save to      │                                                           │
 │  │ PostgreSQL   │                                                           │
 │  └──────────────┘                                                           │
@@ -72,8 +94,10 @@ A Node.js Express server demonstrating a production-style **RAG (Retrieval-Augme
     └── services/
         ├── chatHistoryService.js # Message log persistence using Prisma
         ├── documentService.js    # Extracts, chunks, embeds, and uploads PDFs to Pinecone
+        ├── evaluationService.js  # RAGAS-style real-time evaluation metrics
+        ├── guardrailService.js   # Input safety validation & output groundedness checks
         ├── llmService.js         # Direct LLM generation helper
-        ├── ragService.js         # RAG pipeline orchestrator (rephrase → decompose → search → re-rank → answer)
+        ├── ragService.js         # RAG pipeline orchestrator (guardrail → rephrase → multi-query → search → re-rank → compress → answer → guardrail)
         └── rerankingService.js   # Re-ranking: keyword overlap scoring + context builder
 ```
 
@@ -173,7 +197,7 @@ Sends the prompt directly to the Gemini LLM model (`gemini-2.5-flash`) without c
 ---
 
 ### 3. Ask a Question with RAG and Memory
-Queries the Pinecone category namespace for relevant context (with sub-query decomposition, re-ranking, and chat history rephrasing) and uses the retrieved context to answer the question using `gemini-2.5-flash`.
+Queries the Pinecone category namespace for relevant context (with multi-query retrieval, re-ranking, and chat history rephrasing) and uses the retrieved context to answer the question using `gemini-2.5-flash`.
 
 * **URL**: `/api/ask-rag`
 * **Method**: `POST`
@@ -182,6 +206,16 @@ Queries the Pinecone category namespace for relevant context (with sub-query dec
   * `question`: The question you want to ask.
   * `category` *(optional)*: The category namespace to search within (e.g. `"faq"`, `"billing"`). Defaults to `"general"`.
   * `sessionId` *(optional)*: The conversation session ID. If not provided, the server auto-generates a new session UUID and returns it in the response so you can reuse it for follow-up questions.
+* **Response Output**:
+  * `answer`: The context-aware answer string with inline source citations (e.g. `[Document: Policy.pdf, Chunk: 3]`).
+  * `sources`: A deduplicated list of unique source documents retrieved for context (e.g., `[ { "source": "Policy.pdf", "category": "general" } ]`).
+  * `sessionId`: The session ID associated with the conversation.
+  * `evaluation`: Real-time RAGAS-style grading results of the answer:
+    * `faithfulness` *(number)*: 0.0 to 1.0 (is the answer grounded in context).
+    * `answerRelevance` *(number)*: 0.0 to 1.0 (does it directly answer the user question).
+    * `contextPrecision` *(number)*: 0.0 to 1.0 (relevance of retrieved segments).
+    * `details` *(object)*: Contains claim checks and text explanations.
+  * `guardrailBlocked` *(boolean)*: Indicates if either the Input Guardrail (prompt safety check) or Output Guardrail (hallucination filter) triggered and blocked the query/response.
 
 ---
 

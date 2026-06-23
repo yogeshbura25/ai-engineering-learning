@@ -3,8 +3,26 @@ import { pineconeIndex } from "../config/pinecone.js";
 import prisma from "../config/prisma.js";
 import { getChatHistory, saveMessage } from "./chatHistoryService.js";
 import { rerankMatches, buildContext, logRerankResults } from "./rerankingService.js";
+import { evaluateRAG } from "./evaluationService.js";
+import { validateInputGuardrail, validateOutputGuardrail } from "./guardrailService.js";
 
 export const askRAG = async (question, category, sessionId) => {
+  // Step 0: Input Guardrail Check (PII, Prompt Injection, Scope)
+  const inputCheck = await validateInputGuardrail(question);
+  if (!inputCheck.safe) {
+    console.warn(`[RAG Input Guardrail Blocked] Question: "${question}". Reason: ${inputCheck.reason}`);
+    return {
+      answer: "I am sorry, but your query could not be processed as it violates safety or scope guidelines.",
+      sources: [],
+      evaluation: {
+        faithfulness: 0.0,
+        answerRelevance: 0.0,
+        contextPrecision: 0.0
+      },
+      guardrailBlocked: true
+    };
+  }
+
   let searchQuery = question;
   let history = [];
 
@@ -41,37 +59,38 @@ Standalone Question:`;
     }
   }
 
-  // Step 2: Query Decomposition (Sub-Query RAG)
+  // Step 2: Multi-Query Generation (Retrieval Query Expansion)
   let subQueries = [searchQuery];
   try {
-    const decompositionPrompt = `
-You are an expert search assistant.
-Decompose the following user question into 1 to 3 simpler, independent, standalone sub-questions that can be used for vector search.
-If the question is already simple and cannot be decomposed, return it as the only element in the array.
+    const multiQueryPrompt = `
+You are an expert search assistant. Your task is to generate 3 different versions/formulations of the given user question to retrieve relevant documents from a vector database.
+By generating multiple perspectives on the question, your goal is to help the user overcome some of the limitations of distance-based similarity search.
+If the question is extremely simple, you should still provide alternative formulations (e.g., using synonyms or rephrasing).
 
-Respond ONLY with a valid JSON array of strings. Do not include markdown code block formatting (like \`\`\`json) or any other text.
+Respond ONLY with a valid JSON array of strings containing the original question plus the 3 variations (total 4 items). Do not include markdown code block formatting (like \`\`\`json) or any other text.
 
 Question: "${searchQuery}"
 `;
 
-    const decompositionResponse = await geminiai.models.generateContent({
+    const multiQueryResponse = await geminiai.models.generateContent({
       model: "gemini-2.5-flash",
-      contents: decompositionPrompt,
+      contents: multiQueryPrompt,
     });
 
-    const cleanText = decompositionResponse.text.trim().replace(/^```json\s*|```\s*$/gi, '');
+    const cleanText = multiQueryResponse.text.trim().replace(/^```json\s*|```\s*$/gi, '');
     const parsed = JSON.parse(cleanText);
     if (Array.isArray(parsed) && parsed.length > 0) {
       subQueries = parsed;
-      console.log(`[RAG Sub-Queries] Decomposed into:`, subQueries);
+      console.log(`[RAG Multi-Query] Generated queries for retrieval:`, subQueries);
     }
   } catch (err) {
-    console.error("Failed to decompose query, using fallback:", err.message);
+    console.error("Failed to generate multi-query variations, using fallback:", err.message);
   }
 
   // Step 3: Embed and Query Pinecone (semantic) + Query Postgres (keyword) for each sub-query in parallel
   const allMatches = [];
   let context = '';
+  let rerankedMatches = [];
   try {
     const queryPromises = subQueries.map(async (subQ) => {
       // 1. Semantic Search: Embed and Query Pinecone
@@ -172,13 +191,16 @@ Question: "${searchQuery}"
     }
 
     // Step 3b: Re-rank matches using keyword overlap
-    const rerankedMatches = rerankMatches(allMatches, searchQuery);
+    rerankedMatches = rerankMatches(allMatches, searchQuery);
     logRerankResults(allMatches, rerankedMatches);
 
     // Step 4: Build Context (Sorted chronologically by chunkIndex for cohesion)
-    context = buildContext(rerankedMatches, 7);
+    const rawContext = buildContext(rerankedMatches, 7);
+
+    // Step 4b: Compress Context using LLM extraction
+    context = await compressContext(rawContext, searchQuery);
   } catch (error) {
-    console.error("Error during sub-query parallel search:", error);
+    console.error("Error during sub-query parallel search or context compression:", error);
     throw error;
   }
 
@@ -193,12 +215,12 @@ You are an expert customer support AI assistant specializing in answering user q
 </System Role>
 
 <Instructions>
-1. Analyze the retrieved [Context] and the [Chat History] carefully.
+1. Analyze the retrieved [Context] (which contains source labels like [Document: filename, Chunk: index]) and the [Chat History] carefully.
 2. Answer the [User Question] accurately, and explain it naturally.
-3. Prioritize information matching the category of the question if applicable.
-Use all relevant information from the provided context.
-4. If multiple context sections answer different parts of the question,
-5. combine them into a single complete response.
+3. For every claim, fact, or answer segment you construct, you MUST cite the source inline at the end of the sentence or clause using the format [Document: filename, Chunk: index] (e.g. "... RAG improves retrieval quality [Document: Company_Policy.pdf, Chunk: 3].").
+4. If multiple context segments apply to a claim, cite them all (e.g., "... [Document: Policy.pdf, Chunk: 1] [Document: Benefits.pdf, Chunk: 0]").
+5. Do not invent citations. Only use the sources explicitly provided in the [Context].
+6. Prioritize information matching the category of the question if applicable.
 </Instructions>
 
 <Guardrails>
@@ -235,18 +257,92 @@ ${question}
 
   const answer = llmResponse.text;
 
-  // Step 7: Save interaction to PostgreSQL
+  // Compile unique sources from the retrieved matches
+  const uniqueSources = [];
+  const seenSources = new Set();
+  rerankedMatches.slice(0, 7).forEach((m) => {
+    const src = m.metadata?.source;
+    if (src && !seenSources.has(src)) {
+      seenSources.add(src);
+      uniqueSources.push({
+        source: src,
+        category: m.metadata?.category ?? 'general',
+      });
+    }
+  });
+
+  // Step 7: Perform RAGAS-style evaluation
+  const evaluation = await evaluateRAG(question, context, answer);
+
+  // Step 8: Output Guardrail Check (Hallucination Protection)
+  const outputCheck = validateOutputGuardrail(evaluation.faithfulness, answer);
+  const finalAnswer = outputCheck.answer;
+
+  // Step 9: Save interaction to PostgreSQL
   if (sessionId) {
     try {
       await saveMessage(sessionId, 'user', question);
-      await saveMessage(sessionId, 'model', answer);
+      await saveMessage(sessionId, 'model', finalAnswer);
     } catch (err) {
       console.error("Failed to save conversation message log:", err);
     }
   }
 
   return {
-    answer,
+    answer: finalAnswer,
+    sources: uniqueSources,
+    evaluation,
+    guardrailBlocked: !outputCheck.safe
   };
 
+}
+
+/**
+ * Compress the retrieved context by extracting only the sentences and facts
+ * directly relevant to the user query using Gemini.
+ *
+ * @param {string} rawContext  - The full concatenated context text
+ * @param {string} searchQuery - The user's search query
+ * @returns {Promise<string>} The compressed context text
+ */
+async function compressContext(rawContext, searchQuery) {
+  if (!rawContext || !rawContext.trim()) {
+    return "";
+  }
+
+  try {
+    const compressionPrompt = `
+You are a context compression assistant. 
+Given the following retrieved [Documents] and the user [Question], extract ONLY the specific sentences, sentences parts, figures, or key facts that are directly relevant to answering the question.
+
+Guidelines:
+1. Keep the exact factual information intact.
+2. Discard all filler text, formatting boilerplate, headers, and irrelevant background details.
+3. Keep the source labels [Document: filename, Chunk: index] for the extracted facts so the user knows where they came from. Ensure the source label prefix is placed right before the facts extracted from that document.
+4. Do NOT answer the question. Only return the compressed relevant context facts with their source labels.
+5. If nothing in the documents is relevant to the question, respond with: "No relevant facts found."
+
+[Documents]:
+${rawContext}
+
+[Question]:
+${searchQuery}
+
+Compressed Context:`;
+
+    const response = await geminiai.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: compressionPrompt,
+      config: {
+        temperature: 0.0,
+      }
+    });
+
+    const compressed = response.text.trim();
+    console.log(`[RAG Context Compression] Compressed context length from ${rawContext.length} to ${compressed.length} characters.`);
+    return compressed;
+  } catch (error) {
+    console.error("Context compression failed, falling back to raw context:", error.message);
+    return rawContext;
+  }
 }
