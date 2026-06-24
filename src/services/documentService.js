@@ -190,7 +190,7 @@ export async function uploadDocument(filePath, fileName, category = "general") {
 
     console.time("pinecone-upsert");
 
-    const BATCH_SIZE = 100;
+    const BATCH_SIZE = 10;
 
     for (let i = 0; i < vectors.length; i += BATCH_SIZE) {
       const batch = vectors.slice(i, i + BATCH_SIZE);

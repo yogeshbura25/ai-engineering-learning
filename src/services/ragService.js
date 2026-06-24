@@ -160,7 +160,7 @@ Question: "${searchQuery}"
 
     // Merge and deduplicate matches
     const seenIds = new Set();
-    
+
     // First add all vector matches (maintaining their high-fidelity vector similarity scores)
     for (const res of resultsArray) {
       for (const match of res.vectorMatches) {
